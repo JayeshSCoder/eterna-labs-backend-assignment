@@ -1,8 +1,8 @@
 import WebSocket from 'ws';
 import axios from 'axios';
 
-const API_URL = 'http://localhost:3000/api/orders';
-const WS_URL = 'ws://localhost:3000/ws/orders';
+const API_URL = 'https://eterna-labs-backend-assignment.onrender.com/api/orders';
+const WS_URL = 'wss://eterna-labs-backend-assignment.onrender.com/ws/orders';
 
 async function main() {
   try {
