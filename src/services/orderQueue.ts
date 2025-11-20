@@ -31,13 +31,15 @@ async function processOrder(job: Job): Promise<any> {
 
   try {
     // Step 1: Routing - Update status and get quotes
-    websocketService.notifyStatus(order_id, 'routing');
+    console.log(`Order ${order_id}: Routing - Comparing DEX prices...`);
+    websocketService.notifyStatus(order_id, 'routing', {
+      message: 'Comparing DEX prices',
+    });
     
     await pool.query(
       'UPDATE orders SET status = $1 WHERE order_id = $2',
       ['routing', order_id]
     );
-    console.log(`Order ${order_id}: Status updated to 'routing'`);
 
     // Get quotes from both DEXs
     const [raydiumQuote, meteoraQuote] = await Promise.all([
@@ -45,8 +47,8 @@ async function processOrder(job: Job): Promise<any> {
       mockDexRouter.getMeteoraQuote(token_in, token_out, amount),
     ]);
 
-    console.log(`Raydium quote: Price ${raydiumQuote.price}, Fee ${raydiumQuote.fee}`);
-    console.log(`Meteora quote: Price ${meteoraQuote.price}, Fee ${meteoraQuote.fee}`);
+    console.log(`  - Raydium quote: Price ${raydiumQuote.price}, Fee ${raydiumQuote.fee}`);
+    console.log(`  - Meteora quote: Price ${meteoraQuote.price}, Fee ${meteoraQuote.fee}`);
 
     // Step 2: Selection - Calculate effective prices and determine best route
     const raydiumEffectivePrice = raydiumQuote.price * (1 - raydiumQuote.fee);
@@ -58,30 +60,51 @@ async function processOrder(job: Job): Promise<any> {
     if (raydiumEffectivePrice > meteoraEffectivePrice) {
       selectedDex = 'Raydium';
       bestPrice = raydiumEffectivePrice;
-      console.log(`✓ Best route: Raydium (${raydiumEffectivePrice}) vs Meteora (${meteoraEffectivePrice})`);
+      console.log(`Best route selected: Raydium (${raydiumEffectivePrice.toFixed(6)}) vs Meteora (${meteoraEffectivePrice.toFixed(6)})`);
     } else {
       selectedDex = 'Meteora';
       bestPrice = meteoraEffectivePrice;
-      console.log(`✓ Best route: Meteora (${meteoraEffectivePrice}) vs Raydium (${raydiumEffectivePrice})`);
+      console.log(`Best route selected: Meteora (${meteoraEffectivePrice.toFixed(6)}) vs Raydium (${raydiumEffectivePrice.toFixed(6)})`);
     }
 
-    // Step 3: Execution - Notify processing and execute swap
-    websocketService.notifyStatus(order_id, 'processing', {
-      bestRoute: selectedDex,
+    // Step 3: Building - Create transaction
+    console.log(`Order ${order_id}: Building transaction on ${selectedDex}...`);
+    websocketService.notifyStatus(order_id, 'building', {
+      message: 'Creating transaction',
+      selectedDex,
       bestPrice,
       raydiumPrice: raydiumEffectivePrice,
       meteoraPrice: meteoraEffectivePrice,
     });
 
-    console.log(`Executing swap on ${selectedDex}...`);
+    await pool.query(
+      'UPDATE orders SET status = $1, provider = $2 WHERE order_id = $3',
+      ['building', selectedDex, order_id]
+    );
+
+    // Simulate building transaction (small delay)
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    // Step 4: Submitted - Execute swap
+    console.log(`Order ${order_id}: Submitting transaction to network...`);
+    websocketService.notifyStatus(order_id, 'submitted', {
+      message: 'Transaction sent to network',
+      selectedDex,
+    });
+
+    await pool.query(
+      'UPDATE orders SET status = $1 WHERE order_id = $2',
+      ['submitted', order_id]
+    );
+
     const swapResult = await mockDexRouter.executeSwap(selectedDex, token_in, amount);
 
-    console.log(`✓ Swap completed! TxHash: ${swapResult.txHash}`);
+    console.log(`Order ${order_id}: Transaction confirmed! TxHash: ${swapResult.txHash}`);
 
-    // Step 4: Success - Update database with confirmed status
+    // Step 5: Confirmed - Update database with confirmed status
     await pool.query(
-      'UPDATE orders SET status = $1, tx_hash = $2, provider = $3 WHERE order_id = $4',
-      ['confirmed', swapResult.txHash, selectedDex, order_id]
+      'UPDATE orders SET status = $1, tx_hash = $2 WHERE order_id = $3',
+      ['confirmed', swapResult.txHash, order_id]
     );
 
     const result = {
@@ -89,7 +112,8 @@ async function processOrder(job: Job): Promise<any> {
       selectedDex,
       bestPrice,
       txHash: swapResult.txHash,
-      status: swapResult.status,
+      status: 'confirmed',
+      message: 'Transaction successful',
     };
 
     // Notify success via WebSocket
@@ -98,8 +122,8 @@ async function processOrder(job: Job): Promise<any> {
 
     return result;
   } catch (error) {
-    // Step 5: Error Handling - Update database and notify failure
-    console.error(`Error processing order ${order_id}:`, error);
+    // Step 6: Failed - Error Handling
+    console.error(`Order ${order_id}: Failed -`, error);
 
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
 
@@ -110,7 +134,8 @@ async function processOrder(job: Job): Promise<any> {
       );
 
       websocketService.notifyStatus(order_id, 'failed', {
-        reason: errorMessage,
+        message: 'Order execution failed',
+        error: errorMessage,
       });
 
       console.log(`Order ${order_id}: Status updated to 'failed'`);

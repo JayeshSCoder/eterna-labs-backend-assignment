@@ -52,17 +52,5 @@ const start = async () => {
   }
 };
 
-// Handle graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('\nGracefully shutting down...');
-  await app.close();
-  process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-  console.log('\nGracefully shutting down...');
-  await app.close();
-  process.exit(0);
-});
 
 start();

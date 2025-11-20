@@ -5,6 +5,9 @@ dotenv.config();
 
 const pool = new Pool({
   connectionString: process.env.POSTGRES_URL,
+  ssl: {
+    rejectUnauthorized: false, // Crucial for Neon connection to work
+  },
 });
 
 pool.on('connect', () => {
@@ -20,6 +23,10 @@ export async function initDb(): Promise<void> {
   const client = await pool.connect();
   
   try {
+    // Drop existing table if it has old constraint
+    await client.query(`DROP TABLE IF EXISTS orders;`);
+    
+    // Create table with updated status constraint
     await client.query(`
       CREATE TABLE IF NOT EXISTS orders (
         id SERIAL PRIMARY KEY,
@@ -28,7 +35,7 @@ export async function initDb(): Promise<void> {
         token_in VARCHAR(255) NOT NULL,
         token_out VARCHAR(255) NOT NULL,
         amount DECIMAL(36, 18) NOT NULL,
-        status VARCHAR(50) NOT NULL CHECK (status IN ('pending', 'routing', 'confirmed', 'failed')),
+        status VARCHAR(50) NOT NULL CHECK (status IN ('pending', 'routing', 'building', 'submitted', 'confirmed', 'failed')),
         provider VARCHAR(255),
         tx_hash VARCHAR(255),
         created_at TIMESTAMP DEFAULT NOW()
