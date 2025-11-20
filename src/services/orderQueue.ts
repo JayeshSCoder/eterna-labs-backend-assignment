@@ -1,6 +1,8 @@
 import { Queue, Worker, Job } from 'bullmq';
 import redis from '../config/redis';
 import mockDexRouter from './dexRouter';
+import websocketService from './websocketService';
+import pool from '../config/database';
 
 // Create the order queue
 export const orderQueue = new Queue('order-execution-queue', {
@@ -28,6 +30,15 @@ async function processOrder(job: Job): Promise<any> {
   const { order_id, token_in, token_out, amount } = job.data;
 
   try {
+    // Step 1: Routing - Update status and get quotes
+    websocketService.notifyStatus(order_id, 'routing');
+    
+    await pool.query(
+      'UPDATE orders SET status = $1 WHERE order_id = $2',
+      ['routing', order_id]
+    );
+    console.log(`Order ${order_id}: Status updated to 'routing'`);
+
     // Get quotes from both DEXs
     const [raydiumQuote, meteoraQuote] = await Promise.all([
       mockDexRouter.getRaydiumQuote(token_in, token_out, amount),
@@ -37,39 +48,76 @@ async function processOrder(job: Job): Promise<any> {
     console.log(`Raydium quote: Price ${raydiumQuote.price}, Fee ${raydiumQuote.fee}`);
     console.log(`Meteora quote: Price ${meteoraQuote.price}, Fee ${meteoraQuote.fee}`);
 
-    // Calculate effective prices (including fees)
+    // Step 2: Selection - Calculate effective prices and determine best route
     const raydiumEffectivePrice = raydiumQuote.price * (1 - raydiumQuote.fee);
     const meteoraEffectivePrice = meteoraQuote.price * (1 - meteoraQuote.fee);
 
-    // Determine which DEX is cheaper (better price)
     let selectedDex: 'Raydium' | 'Meteora';
     let bestPrice: number;
 
     if (raydiumEffectivePrice > meteoraEffectivePrice) {
       selectedDex = 'Raydium';
       bestPrice = raydiumEffectivePrice;
-      console.log(`✓ Raydium is cheaper: ${raydiumEffectivePrice} vs Meteora: ${meteoraEffectivePrice}`);
+      console.log(`✓ Best route: Raydium (${raydiumEffectivePrice}) vs Meteora (${meteoraEffectivePrice})`);
     } else {
       selectedDex = 'Meteora';
       bestPrice = meteoraEffectivePrice;
-      console.log(`✓ Meteora is cheaper: ${meteoraEffectivePrice} vs Raydium: ${raydiumEffectivePrice}`);
+      console.log(`✓ Best route: Meteora (${meteoraEffectivePrice}) vs Raydium (${raydiumEffectivePrice})`);
     }
 
-    // Execute swap on selected DEX
+    // Step 3: Execution - Notify processing and execute swap
+    websocketService.notifyStatus(order_id, 'processing', {
+      bestRoute: selectedDex,
+      bestPrice,
+      raydiumPrice: raydiumEffectivePrice,
+      meteoraPrice: meteoraEffectivePrice,
+    });
+
     console.log(`Executing swap on ${selectedDex}...`);
     const swapResult = await mockDexRouter.executeSwap(selectedDex, token_in, amount);
 
     console.log(`✓ Swap completed! TxHash: ${swapResult.txHash}`);
 
-    return {
+    // Step 4: Success - Update database with confirmed status
+    await pool.query(
+      'UPDATE orders SET status = $1, tx_hash = $2, provider = $3 WHERE order_id = $4',
+      ['confirmed', swapResult.txHash, selectedDex, order_id]
+    );
+
+    const result = {
       order_id,
       selectedDex,
       bestPrice,
       txHash: swapResult.txHash,
       status: swapResult.status,
     };
+
+    // Notify success via WebSocket
+    websocketService.notifyStatus(order_id, 'confirmed', result);
+    console.log(`Order ${order_id}: Successfully confirmed`);
+
+    return result;
   } catch (error) {
+    // Step 5: Error Handling - Update database and notify failure
     console.error(`Error processing order ${order_id}:`, error);
+
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+
+    try {
+      await pool.query(
+        'UPDATE orders SET status = $1 WHERE order_id = $2',
+        ['failed', order_id]
+      );
+
+      websocketService.notifyStatus(order_id, 'failed', {
+        reason: errorMessage,
+      });
+
+      console.log(`Order ${order_id}: Status updated to 'failed'`);
+    } catch (dbError) {
+      console.error(`Failed to update database for order ${order_id}:`, dbError);
+    }
+
     throw error;
   }
 }
